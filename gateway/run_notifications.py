@@ -1180,7 +1180,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return None  # Suppressed noise is terminal, not a consumed process result.
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
-        accepted = identity_claimed = refused = False
+        accepted = identity_claimed = refused = replay_capped = False
         try:
             claim = await self._preflight_completion_delivery(evt)
             if not claim.proceed:
@@ -1212,12 +1212,24 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return True
         except WakeNotAccepted:
             refused = True
-            return False
+            # A refusal with the row already past the replay-age cap is terminal, not retryable: the
+            # defer settlement refunds the attempt, so a never-admitting target would otherwise be
+            # deferred on every watcher tick forever (#141893) while its startup twin is dropped.
+            if claim.claim_id:
+                from tools.async_delegation import _MAX_COMPLETION_REPLAY_AGE_S, pending_completion_past_replay_age
+                replay_capped = pending_completion_past_replay_age(claim.delegation_id)
+                if replay_capped:
+                    logger.warning(
+                        "Async delegation %s: refusing admission for a pending completion past the "
+                        "%.0fh replay-age cap; terminally dropping the delivery (result remains queryable).",
+                        claim.delegation_id, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0)
+            return None if replay_capped else False
         finally:
             if identity_claimed and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
-            operation = "complete" if accepted else "defer" if refused or claim.defer else "release"
+            operation = ("complete" if accepted else "drop" if replay_capped
+                         else "defer" if refused or claim.defer else "release")
             if claim.claim_id:
                 self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id)
             for sibling, claim_id in sibling_claims:
