@@ -58,6 +58,14 @@ MAX_DERIVED_TITLE_CHARS = 48
 # answer-shaped output guard in generate_title; port of can1357/oh-my-pi#7306). 12 leaves headroom for
 # legitimate wordy titles while excluding full-sentence answers.
 _MAX_TITLE_WORDS = 12
+# CJK text carries no spaces, so the word bound is blind to it: a 76-character Chinese assistant reply
+# splits into 3 "words" and sailed through the guard (saved as the session title, #141969). A title is
+# ~10-25 CJK characters; a reply is 40+. 30 leaves room for a real multi-clause CJK title.
+_MAX_TITLE_CJK_CHARS = 30
+# A CJK reply diluted with Latin words ("我是ChatGPT，由OpenAI开发。…") can stay under both the word
+# and the pure-CJK bounds, but a reply ends with sentence punctuation and a CJK title never does —
+# fullwidth terminators are a reply's signature (ASCII terminators are already stripped by _clean_title).
+_CJK_SENTENCE_TERMINATORS = "。！？；，、：…"
 # Output budget for the title call: room for a fenced/prefixed JSON reply and for a reasoning model that
 # thinks despite the thinking-disabled request, without letting a runaway reply burn minutes.
 TITLE_MAX_TOKENS = 512
@@ -468,6 +476,17 @@ def _is_prompt_example_echo(title: str) -> bool:
     return normalized in _EXAMPLE_ECHO_REJECT
 
 
+def _cjk_char_count(text: str) -> int:
+    """Count CJK characters (ideographs, kana, hangul): word-like units for scripts that carry no
+    spaces, so the answer-shaped guard can bound them the way it bounds space-delimited words."""
+    return sum(
+        1 for ch in text
+        if "\u4e00" <= ch <= "\u9fff"      # CJK Unified Ideographs
+        or "\u3040" <= ch <= "\u30ff"      # Hiragana / Katakana
+        or "\uac00" <= ch <= "\ud7af"      # Hangul syllables
+    )
+
+
 def generate_title(
     user_message: str,
     timeout: Optional[float] = None,
@@ -536,9 +555,19 @@ def generate_title(
         # something I recognize..."). Truncating would store half an assistant blob as the session title,
         # which is still an assistant blob — reject instead so the caller retries on the next exchange
         # (maybe_auto_title retries a placeholder title through the third exchange). Port of can1357/oh-my-pi#7306.
-        if title is not None and len(title.split()) > _MAX_TITLE_WORDS:
+        # CJK replies carry no spaces, so the word bound alone is blind to them: the pure-CJK bound and the
+        # fullwidth-sentence-terminator bound catch a Chinese/Japanese/Korean answer the same way (#141969).
+        cjk_chars = _cjk_char_count(title)
+        cjk_reply_ending = title.endswith(tuple(_CJK_SENTENCE_TERMINATORS)) if cjk_chars else False
+        if title is not None and (
+            len(title.split()) > _MAX_TITLE_WORDS
+            or cjk_chars > _MAX_TITLE_CJK_CHARS
+            or cjk_reply_ending
+        ):
             # Answer-shaped output: reject (not truncate) so the caller retries next exchange.
-            logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), _MAX_TITLE_WORDS)
+            logger.debug("Rejecting answer-shaped title output (%d words > %d, %d CJK chars > %d, "
+                         "or a CJK sentence terminator)",
+                         len(title.split()), _MAX_TITLE_WORDS, cjk_chars, _MAX_TITLE_CJK_CHARS)
             return None
         # Example-echo guard: a title that parrots one of the prompt's own
         # examples back verbatim says nothing about the session — reject it so

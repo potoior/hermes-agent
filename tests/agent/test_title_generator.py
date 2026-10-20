@@ -239,6 +239,43 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", return_value=mock_response):
             assert generate_title("how does the registration system work?", "...") is None
 
+    def test_rejects_cjk_answer_shaped_output(self):
+        """CJK replies carry no spaces, so the word bound counts a 76-character Chinese answer
+        as 3 "words" and it sailed through as the session title. Regression for #141969; both
+        samples are titles actually saved on the reporting host's state.db."""
+        for answer in (
+            "好的，这个可以做。不过我现在看不到 hermesbubble 的代码（这条对话里没带仓库/文件），"
+            "所以先把改造方案列出来再说。",
+            "我是ChatGPT，由OpenAI开发。当前对话里没有提供可披露的具体模型版本号。",
+        ):
+            mock_response = MagicMock()
+            mock_response.choices = [MagicMock()]
+            mock_response.choices[0].message.content = answer
+
+            with patch("agent.title_generator.call_llm", return_value=mock_response):
+                assert generate_title("怎样改造这个项目？", "...") is None
+
+    def test_accepts_short_cjk_title(self):
+        """A real CJK title is ~10-25 characters and must pass both bounds."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "修复登录按钮的样式问题"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("帮我修复登录按钮", "...") == "修复登录按钮的样式问题"
+
+    def test_cjk_guard_covers_kana_and_hangul_answers(self):
+        """The character bound counts kana and hangul too, so a Japanese or Korean
+        answer-shaped reply is rejected the same way as a Chinese one."""
+        for answer in ("はい、それは可能です。ただし、この会話にはリポジトリが含まれていないため、まずは改善案をまとめてから説明しますね。",
+                       "네, 가능합니다. 다만 이 대화에는 저장소가 포함되어 있지 않아서, 먼저 개선 방안을 정리한 뒤 설명드리겠습니다."):
+            mock_response = MagicMock()
+            mock_response.choices = [MagicMock()]
+            mock_response.choices[0].message.content = answer
+
+            with patch("agent.title_generator.call_llm", return_value=mock_response):
+                assert generate_title("このプロ젝クトを改造する方法は？", "...") is None
+
     def test_rejects_many_short_words(self):
         """13 short words stays under the 80-char cap but is not a title."""
         mock_response = MagicMock()
