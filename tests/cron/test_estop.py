@@ -128,6 +128,77 @@ def test_cron_tick_resumes_after_disengage(hermes_home, monkeypatch):
     assert calls == [1], "resume must restore normal cron dispatch"
 
 
+# ── manual `hermes cron run` gate (#142820) ─────────────────────────────────
+
+
+def _patch_manual_run_paths(monkeypatch, started):
+    """Record every path that could start a manual run; none may fire while ESTOP holds."""
+    import tools.cronjob_tools as cronmod
+
+    def _record(kind):
+        def _fn(*args, **kwargs):
+            started.append(kind)
+        return _fn
+
+    monkeypatch.setattr(cronmod, "_hand_off_primary_routed_run", _record("handoff"))
+    monkeypatch.setattr(cronmod, "_try_dispatch_background_run", _record("dispatch"))
+    monkeypatch.setattr(cronmod, "_forward_relay_fronted_run", _record("relay"))
+    monkeypatch.setattr(cronmod, "_execute_job_now", _record("inline"))
+    monkeypatch.setattr(cronmod, "_refreshed_job_view", lambda job_id: {})
+    return cronmod
+
+
+def test_cron_manual_run_refuses_when_engaged(hermes_home, monkeypatch):
+    started = []
+    cronmod = _patch_manual_run_paths(monkeypatch, started)
+
+    estop.engage(reason="incident")
+    result = cronmod._action_run({"id": "job-1"}, {"prompt": None, "session_id": None})
+
+    assert started == [], "engaged ESTOP must leave the job unstarted"
+    assert "hermes resume" in result
+    assert "paused" in result.lower()
+
+
+def test_cron_manual_run_refuses_on_stat_error(hermes_home, monkeypatch):
+    """Fail-safe: an unreadable sentinel still counts as engaged, so the manual run refuses."""
+    started = []
+    cronmod = _patch_manual_run_paths(monkeypatch, started)
+
+    class _BoomPath:
+        def exists(self):
+            raise OSError("permission denied")
+
+    monkeypatch.setattr(estop, "sentinel_path", lambda: _BoomPath())
+    result = cronmod._action_run({"id": "job-1"}, {"prompt": None, "session_id": None})
+
+    assert started == [], "stat-error ESTOP must fail safe and refuse the manual run"
+    assert "hermes resume" in result
+
+
+def test_cron_manual_run_dispatches_after_resume(hermes_home, monkeypatch):
+    """The gate holds only while the sentinel exists: after `hermes resume` a manual run
+    reaches the normal dispatch path."""
+    started = []
+    cronmod = _patch_manual_run_paths(monkeypatch, started)
+
+    estop.engage()
+    cronmod._action_run({"id": "job-1"}, {"prompt": None, "session_id": None})
+    assert started == []
+
+    estop.disengage()
+
+    def _dispatched(*args, **kwargs):
+        started.append("dispatch")
+        return {"dispatched": True, "delegation_id": "d-1"}
+
+    monkeypatch.setattr(cronmod, "_try_dispatch_background_run", _dispatched)
+    result = cronmod._action_run({"id": "job-1"}, {"prompt": None, "session_id": None})
+
+    assert "dispatch" in started, "resume must restore the manual run"
+    assert '"success": true' in result.lower()
+
+
 # ── kanban dispatcher integration ───────────────────────────────────────────
 
 

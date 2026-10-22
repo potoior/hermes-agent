@@ -752,6 +752,12 @@ def _refreshed_job_view(job_id: str) -> dict[str, Any]:
 
 def _action_run(job: dict[str, Any], a: dict[str, Any]) -> str:
     job_id = job["id"]
+    # `hermes pause` ESTOP: a manual run refuses exactly like the tick skips dispatch — no new
+    # work starts while the sentinel exists, in-flight runs are never touched, and an unreadable
+    # or empty sentinel still counts as engaged (fail-safe, #142820).
+    from agent.estop import check_paused as _estop_check_paused, paused_reply
+    if _estop_check_paused("cron", logger):
+        return tool_error(paused_reply() or "Hermes is paused; run `hermes resume`.", success=False)
     # `prompt` on run is transient per-fire context appended to the stored prompt, never
     # persisted; same strict scan as stored prompts.
     extra_prompt = a["prompt"] or None
